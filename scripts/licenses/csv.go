@@ -56,6 +56,7 @@ func csvMain(_ *cobra.Command, args []string) error {
 		return err
 	}
 	for _, lib := range libs {
+		glog.V(2).Infof("checking lib: %s", lib)
 		licenseURL := "Unknown"
 		licenseName := "Unknown"
 		if lib.LicensePath != "" {

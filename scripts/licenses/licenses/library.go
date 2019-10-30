@@ -70,6 +70,7 @@ func Libraries(ctx context.Context, importPaths ...string) ([]*Library, error) {
 	pkgsByLicense := make(map[string][]*packages.Package)
 	errorOccurred := false
 	packages.Visit(rootPkgs, func(p *packages.Package) bool {
+		glog.V(4).Infof(p.Name)
 		if len(p.Errors) > 0 {
 			errorOccurred = true
 			return false
