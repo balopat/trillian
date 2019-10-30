@@ -20,6 +20,7 @@ import (
 	"crypto"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -167,7 +168,7 @@ func createSomeNodes(count int) []stree.Node {
 		r[i].NodeID = stree.NewNodeIDFromPrefix([]byte{byte(i)}, 0, 8, 8, 8)
 		h := sha256.Sum256([]byte{byte(i)})
 		r[i].Hash = h[:]
-		glog.Infof("Node to store: %v\n", r[i].NodeID)
+		glog.V(3).Infof("Node to store: %v\n", r[i].NodeID)
 	}
 	return r
 }
@@ -262,6 +263,25 @@ func cleanTestDB(db *sql.DB) {
 	}
 }
 
+func getVersion(db *sql.DB) (string, error) {
+	rows, err := db.QueryContext(context.TODO(), "SELECT @@GLOBAL.version")
+	if err != nil {
+		return "", fmt.Errorf("getVersion: failed to perform query: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", errors.New("getVersion: cursor has no rows")
+	}
+	var v string
+	if err := rows.Scan(&v); err != nil {
+		return "", err
+	}
+	if rows.Next() {
+		return "", errors.New("getVersion: too many rows returned")
+	}
+	return v, nil
+}
+
 func mustSignAndStoreLogRoot(ctx context.Context, t *testing.T, l storage.LogStorage, tree *trillian.Tree, treeSize uint64) {
 	t.Helper()
 	signer := tcrypto.NewSigner(0, testonly.NewSignerWithFixedSig(nil, []byte("notnil")), crypto.SHA256)
@@ -305,6 +325,9 @@ func TestMain(m *testing.M) {
 
 	DB, done = openTestDBOrDie()
 
+	if v, err := getVersion(DB); err == nil {
+		glog.Infof("MySQL version '%v'", v)
+	}
 	status := m.Run()
 	done(context.Background())
 	os.Exit(status)

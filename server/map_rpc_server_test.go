@@ -15,6 +15,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"github.com/google/trillian/extension"
 	"github.com/google/trillian/storage"
 	stestonly "github.com/google/trillian/storage/testonly"
+	"github.com/google/trillian/testonly"
 	"github.com/google/trillian/types"
 	"github.com/kylelemons/godebug/pretty"
 	"google.golang.org/grpc/codes"
@@ -32,6 +34,8 @@ import (
 )
 
 const mapID1 = int64(1)
+
+var b64 = testonly.MustDecodeBase64
 
 func TestIsHealthy(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -403,6 +407,95 @@ func TestSetLeavesEmpty(t *testing.T) {
 			})
 			if got, want := err != nil, tc.wantErr; got != want {
 				t.Fatalf("SetLeaves: %v, wantErr=%v", err, want)
+			}
+		})
+	}
+}
+
+func TestSetLeaves(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ctx := context.Background()
+
+	leaves := []*trillian.MapLeaf{
+		{Index: b64("gXQJloeiZiH04s3XzAOz2s7bP7liJVsar9Azyr6DFTA="), LeafValue: []byte("value1")},
+		{Index: b64("sQJTdkyLIz+zdULiNAHHtFDlpvl1HztaAU9vZ+i8mZ0="), LeafValue: []byte("value2")},
+		{Index: b64("9XYQTuvqsJZR2DrP/HfIuMbqpLdnrqsk19qA+D9R2GU="), LeafValue: []byte("value3")},
+	}
+	// The root hash of the sparse Merkle when the leaves above are inserted.
+	// Copied from other tests in order to catch regressions.
+	rootHash := b64("Ms8A+VeDImofprfgq7Hoqh9cw+YrD/P/qibTmCm5JvQ=")
+
+	for _, tc := range []struct {
+		desc    string
+		preload bool
+		splitTX bool
+		leaves  []*trillian.MapLeaf
+		want    []byte
+	}{
+		{desc: "one-leaf", leaves: leaves[:1], want: b64("PPI818D5CiUQQMZulH58LikjxeOFWw2FbnGM0AdVHWA=")},
+		{desc: "multi-leaves", leaves: leaves, want: rootHash},
+		{desc: "preload", preload: true, leaves: leaves, want: rootHash},
+		{desc: "split-tx", splitTX: true, leaves: leaves, want: rootHash},
+		{desc: "split-tx-preload-ignored", preload: true, splitTX: true, leaves: leaves, want: rootHash},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			fakeStorage := storage.NewMockMapStorage(ctrl)
+			adminStorage := fakeAdminStorageForMap(ctrl, 12345)
+			server := NewTrillianMapServer(extension.Registry{
+				MapStorage:   fakeStorage,
+				AdminStorage: adminStorage,
+			}, TrillianMapServerOptions{UseSingleTransaction: !tc.splitTX, UseLargePreload: tc.preload})
+
+			count := len(tc.leaves)
+			fakeStorage.EXPECT().ReadWriteTransaction(gomock.Any(), gomock.Any(), gomock.Any()).
+				DoAndReturn(func(ctx context.Context, tree *trillian.Tree, f storage.MapTXFunc) error {
+					mockTX := storage.NewMockMapTreeTX(ctrl)
+					mockTX.EXPECT().WriteRevision(gomock.Any()).Return(int64(1), nil)
+					mockTX.EXPECT().ReadRevision(gomock.Any()).Return(int64(0), nil)
+					// One Set call per leaf.
+					mockTX.EXPECT().Set(gomock.Any(), gomock.Any(), gomock.Any()).Times(count)
+					if !tc.splitTX {
+						// Leaves are in different shards because the leaf indices are
+						// random. We query one shard per leaf, plus the root shard.
+						merkleGets := count + 1
+						// Plus, possibly, there is a "global" preloading query.
+						if tc.preload {
+							merkleGets++
+						}
+						mockTX.EXPECT().GetMerkleNodes(gomock.Any(), gomock.Any(), gomock.Any()).Times(merkleGets)
+						// Store each leaf's shard, and the root shard.
+						mockTX.EXPECT().SetMerkleNodes(gomock.Any(), gomock.Any()).Times(count + 1)
+					}
+					mockTX.EXPECT().StoreSignedMapRoot(gomock.Any(), gomock.Any())
+					return f(ctx, mockTX)
+				})
+
+			if tc.splitTX {
+				// Reading and storing each shard in a separate transaction.
+				fakeStorage.EXPECT().ReadWriteTransaction(gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(ctx context.Context, tree *trillian.Tree, f storage.MapTXFunc) error {
+						mockTX := storage.NewMockMapTreeTX(ctrl)
+						mockTX.EXPECT().GetMerkleNodes(gomock.Any(), gomock.Any(), gomock.Any())
+						mockTX.EXPECT().SetMerkleNodes(gomock.Any(), gomock.Any())
+						return f(ctx, mockTX)
+					}).Times(count + 1)
+			}
+
+			rsp, err := server.SetLeaves(ctx, &trillian.SetMapLeavesRequest{
+				MapId:    12345,
+				Revision: 1,
+				Leaves:   tc.leaves,
+			})
+			if err != nil {
+				t.Fatalf("SetLeaves: %v", err)
+			}
+			var mapRoot types.MapRootV1
+			if err := mapRoot.UnmarshalBinary(rsp.GetMapRoot().GetMapRoot()); err != nil {
+				t.Fatalf("UnmarshalBinary(root): %v", err)
+			}
+			if got, want := mapRoot.RootHash, tc.want; !bytes.Equal(got, want) {
+				t.Errorf("Hash mismatch: got %x, want %x", got, want)
 			}
 		})
 	}
